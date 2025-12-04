@@ -250,8 +250,6 @@ class State:
     selection_anchor: int | None = None  # task id for range anchor
     undo_stack: List[Snapshot] = field(default_factory=list)
     redo_stack: List[Snapshot] = field(default_factory=list)
-    undo_stack: List[Snapshot] = field(default_factory=list)
-    redo_stack: List[Snapshot] = field(default_factory=list)
 
     def current_date(self) -> dt.date:
         return self.week_start + dt.timedelta(days=self.cursor_day)
@@ -832,6 +830,28 @@ def handle_overdue_tasks(tasks: Dict[dt.date, List[Task]], today: dt.date, move_
             tasks.pop(date, None)
 
 
+def move_tasks_to_date(state: State, target_date: dt.date, tasks_to_move: List[Task]) -> bool:
+    if not tasks_to_move:
+        return False
+    record_undo(state)
+    target_ids = {id(t) for t in tasks_to_move}
+    for date, items in list(state.tasks.items()):
+        state.tasks[date] = [t for t in items if id(t) not in target_ids]
+        if not state.tasks[date]:
+            state.tasks.pop(date, None)
+    dest_list = state.tasks.setdefault(target_date, [])
+    for t in tasks_to_move:
+        t.date = target_date
+        dest_list.append(t)
+    sort_tasks_for_date(state, target_date)
+    state.week_start = week_start_for(target_date, state.first_weekday)
+    state.cursor_day = weekday_index(target_date, state.first_weekday)
+    state.cursor_idx = 0
+    state.clamp_cursor()
+    save_tasks(state.tasks)
+    return True
+
+
 def clone_tasks(tasks: Dict[dt.date, List[Task]]) -> Dict[dt.date, List[Task]]:
     out: Dict[dt.date, List[Task]] = {}
     for date, items in tasks.items():
@@ -1384,26 +1404,8 @@ def main(stdscr: curses.window) -> None:
                 target = parse_jump(text, state.today)
                 if target:
                     targets = [t for _, t in selected_entries(state)] or ([current_task(state)] if current_task(state) else [])
-                    if targets:
-                        record_undo(state)
-                        target_ids = {id(t) for t in targets}
-                        for date, items in list(state.tasks.items()):
-                            state.tasks[date] = [t for t in items if id(t) not in target_ids]
-                            if not state.tasks[date]:
-                                state.tasks.pop(date, None)
-                        dest_list = state.tasks.setdefault(target, [])
-                        for t in targets:
-                            t.date = target
-                            dest_list.append(t)
-                        sort_tasks_for_date(state, target)
-                        state.week_start = week_start_for(target, state.first_weekday)
-                        state.cursor_day = weekday_index(target, state.first_weekday)
-                        state.cursor_idx = 0
-                        state.clamp_cursor()
-                        save_tasks(state.tasks)
-                        status = f"moved {len(targets)}"
-                    else:
-                        status = "no task"
+                    moved = move_tasks_to_date(state, target, targets)
+                    status = f"moved {len(targets)}" if moved else "no task"
                 else:
                     status = "invalid date"
         elif is_action(key, "delete"):
@@ -1501,34 +1503,14 @@ def main(stdscr: curses.window) -> None:
                 target_date = state.week_start + dt.timedelta(days=target_idx)
             elif first == "t":
                 target_date = state.today
-            elif first in ("\x1b",):
-                target_date = None
             else:
                 target_date = None
             if target_date:
                 targets = [t for _, t in selected_entries(state)] or ([current_task(state)] if current_task(state) else [])
-                if targets:
-                    record_undo(state)
-                    # remove from current locations
-                    target_ids = {id(t) for t in targets}
-                    for date, items in list(state.tasks.items()):
-                        state.tasks[date] = [t for t in items if id(t) not in target_ids]
-                        if not state.tasks[date]:
-                            state.tasks.pop(date, None)
-                    # add to target date
-                    dest_list = state.tasks.setdefault(target_date, [])
-                    for t in targets:
-                        t.date = target_date
-                        dest_list.append(t)
-                    sort_tasks_for_date(state, target_date)
-                    state.week_start = week_start_for(target_date, state.first_weekday)
-                    state.cursor_day = weekday_index(target_date, state.first_weekday)
-                    state.cursor_idx = 0
-                    state.clamp_cursor()
-                    status = target_date.isoformat()
-                    save_tasks(state.tasks)
-                else:
-                    status = "no task"
+                moved = move_tasks_to_date(state, target_date, targets)
+                status = target_date.isoformat() if moved else "no task"
+            else:
+                status = ""
             key_buffer.clear()
         elif is_action(key, "command"):
             status = handle_command(stdscr, state, config)
