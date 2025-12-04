@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import configparser
 import curses
 import datetime as dt
@@ -35,6 +36,7 @@ def default_keybinds() -> Dict[str, list]:
         "right": ["l", "KEY_RIGHT"],
         "down": ["j", "KEY_DOWN"],
         "up": ["k", "KEY_UP"],
+        "toggle_view": ["c"],
         "select_range": ["v"],
         "select_single": ["V"],
         "undo": ["u"],
@@ -50,7 +52,9 @@ def default_keybinds() -> Dict[str, list]:
         "paste_after": ["p"],
         "paste_before": ["P"],
         "week_forward": ["w"],
-        "week_back": ["b"],
+        "week_back": ["W"],
+        "month_forward": ["m"],
+        "month_back": ["M"],
         "goto_prefix": ["g"],
         "goto_date": ["G"],
         "jump_prefix": ["t"],
@@ -489,6 +493,8 @@ class State:
     redo_stack: List[Snapshot] = field(default_factory=list)
     dirty: bool = False
     last_save_time: float = 0.0
+    display_mode: str = "week"  # "week" or "calendar"
+    prev_week_focus: dt.date = field(default_factory=dt.date.today)
 
     def update_week_window(self, new_start: dt.date | None = None, cursor_day: int | None = None) -> None:
         if new_start:
@@ -520,6 +526,23 @@ class State:
             self.cursor_idx = 0
         else:
             self.cursor_idx = max(0, min(self.cursor_idx, len(items) - 1))
+
+
+def focus_date(state: State, target: dt.date) -> None:
+    new_start, new_idx, _ = window_for_date(target, state.config)
+    state.update_week_window(new_start, cursor_day=new_idx)
+    state.cursor_idx = 0
+    state.clamp_cursor()
+
+
+def shift_month(date: dt.date, delta: int) -> dt.date:
+    year = date.year + (date.month + delta - 1) // 12
+    month = (date.month + delta - 1) % 12 + 1
+    first_of_month = date.replace(year=year, month=month, day=1)
+    offset = (date - date.replace(day=1)).days
+    days_in_target = calendar.monthrange(year, month)[1]
+    day = min(1 + offset, days_in_target)
+    return first_of_month.replace(day=day)
 
 
 def load_tasks(todo_path: Path) -> Dict[dt.date, List[Task]]:
@@ -798,6 +821,9 @@ def adjust_priority(task: Task, delta: int) -> None:
 
 
 def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool = True) -> None:
+    if state.display_mode == "calendar":
+        draw_calendar(stdscr, state, status=status, show_help=show_help)
+        return
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     required_width = max(MIN_WIDTH, MIN_COL_WIDTH * len(state.day_order))
@@ -937,7 +963,7 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
             draw_block(label, items)
 
 
-    base_help = "q quit  h/l day  j/k task  o/O new  dd delete  yy copy  v/V select  u/U undo/redo  g goto  :help"
+    base_help = "q quit  c toggle view  h/l day  j/k task  o/O new  dd delete  yy copy  v/V select  u/U undo/redo  g goto  :help"
     status_line = "" if not show_help and not status else (status or base_help)
     if state.config and not state.config.show_statusbar and not status:
         stdscr.refresh()
@@ -966,6 +992,99 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
     stdscr.refresh()
 
 
+def draw_calendar(stdscr: curses.window, state: State, status: str = "", show_help: bool = True) -> None:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    border_attr = curses.color_pair(1) | curses.A_DIM
+    try:
+        stdscr.hline(0, 0, curses.ACS_HLINE | border_attr, width)
+        stdscr.hline(height - 1, 0, curses.ACS_HLINE | border_attr, width)
+        stdscr.vline(0, 0, curses.ACS_VLINE | border_attr, height)
+        stdscr.vline(0, width - 1, curses.ACS_VLINE | border_attr, height)
+        stdscr.addch(0, 0, curses.ACS_ULCORNER | border_attr)
+        stdscr.addch(0, width - 1, curses.ACS_URCORNER | border_attr)
+        stdscr.addch(height - 1, 0, curses.ACS_LLCORNER | border_attr)
+        stdscr.addch(height - 1, width - 1, curses.ACS_LRCORNER | border_attr)
+    except curses.error:
+        pass
+
+    inner_width = max(1, width - 2)
+    col_width = max(8, inner_width // 7)
+    start_y = 2
+    rows = 6
+    row_height = max(2, (height - start_y - 2) // rows)
+    grid_height = row_height * rows
+    selected = state.current_date()
+    month_start = selected.replace(day=1)
+    grid_start = week_start_for(month_start, state.first_weekday)
+    header = month_start.strftime("%B %Y")
+    stdscr.addnstr(1, max(1, (width - len(header)) // 2), header, min(len(header), width - 2), curses.A_BOLD)
+
+    # grid lines (no leftmost border line)
+    for col in range(1, 7):
+        x = 1 + col * col_width
+        if x >= width - 1:
+            continue
+        try:
+            stdscr.vline(start_y, x, curses.ACS_VLINE | border_attr, grid_height)
+        except curses.error:
+            pass
+    for r in range(rows + 1):
+        y = start_y + r * row_height
+        if y >= height - 1:
+            continue
+        try:
+            stdscr.hline(y, 1, curses.ACS_HLINE | border_attr, min(inner_width, col_width * 7))
+        except curses.error:
+            pass
+
+    grid_bottom = start_y + grid_height
+    max_cells = rows * 7
+    for i in range(max_cells):
+        date = grid_start + dt.timedelta(days=i)
+        row = i // 7
+        col = i % 7
+        cell_top = start_y + row * row_height
+        cell_left = 1 + col * col_width
+        y = cell_top + 1
+        x = cell_left + 1
+        if y >= grid_bottom or x >= width - 1:
+            continue
+        label = f"{date.day:2d}"
+        tasks = state.tasks.get(date, [])
+        has_tasks = bool(tasks)
+        any_pending = any(not t.done for t in tasks)
+        attr = curses.color_pair(1)
+        if date == state.today:
+            attr = curses.color_pair(2)
+        if has_tasks and any_pending:
+            attr |= curses.A_BOLD
+        if date == selected:
+            attr = curses.color_pair(2) | curses.A_BOLD | curses.A_STANDOUT
+        if date.month != selected.month:
+            attr |= curses.A_DIM
+        marker = "*" if has_tasks else " "
+        cell_text = f"{label}{marker}".ljust(max(1, col_width - 2))
+        try:
+            stdscr.addnstr(y, x, cell_text, max(1, col_width - 2), attr)
+        except curses.error:
+            continue
+        if tasks and row_height > 2:
+            max_lines = row_height - 2
+            body_lines = [t.visible_body() for t in tasks if t.text.strip()]
+            for idx_line, text in enumerate(body_lines[:max_lines]):
+                line_y = y + 1 + idx_line
+                if line_y >= cell_top + row_height:
+                    break
+                stdscr.addnstr(line_y, x, text[: max(1, col_width - 2)], max(1, col_width - 2), curses.color_pair(1))
+
+    status_y = height - 2
+    base_help = ""
+    status_line = "" if not show_help and not status else (status or base_help)
+    usable_width = max(0, inner_width - 1)
+    stdscr.addnstr(status_y, 1, " " * inner_width, inner_width)
+    stdscr.addnstr(status_y, 2, status_line[:usable_width], usable_width, curses.color_pair(1) | curses.A_DIM)
+    stdscr.refresh()
 def insert_or_edit(stdscr: curses.window, state: State) -> None:
     items = state.tasks.setdefault(state.current_date(), [])
     current_text = items[state.cursor_idx].edit_text() if items else ""
@@ -1298,6 +1417,8 @@ def show_keybinds(stdscr: curses.window, config: Config) -> None:
         "paste_before": "paste before",
         "week_forward": "next week",
         "week_back": "prev week",
+        "month_forward": "next month",
+        "month_back": "prev month",
         "goto_prefix": "goto (days)",
         "goto_date": "goto date (G)",
         "jump_prefix": "jump (t)",
@@ -1311,6 +1432,7 @@ def show_keybinds(stdscr: curses.window, config: Config) -> None:
         "select_single": "select toggle (V)",
         "undo": "undo",
         "redo": "redo",
+        "toggle_view": "toggle calendar (c)",
     }
     actions = list(config.keybinds.items())
     actions.sort(key=lambda pair: pair[0])
@@ -1601,6 +1723,7 @@ def main(stdscr: curses.window) -> None:
         first_weekday=config.first_weekday,
         config=config,
         last_save_time=time.monotonic(),
+        display_mode="week",
     )
     state.update_week_window(state.week_start, state.cursor_day)
     for d in list(state.tasks.keys()):
@@ -1694,49 +1817,110 @@ def main(stdscr: curses.window) -> None:
             continue
 
         if key == "\x1b":
+            if state.display_mode == "calendar":
+                state.display_mode = "week"
+                focus_date(state, state.prev_week_focus)
+                status = "week view"
+                key_buffer.clear()
+                continue
             if state.selected_ids:
                 clear_selection(state)
                 status = "selection cleared"
             key_buffer.clear()
             continue
 
+        def is_week_forward(key_obj: object) -> bool:
+            return key_obj in config.keybinds.get("week_forward", set()) or key_obj == "w"
+
+        def is_week_back(key_obj: object) -> bool:
+            return key_obj in config.keybinds.get("week_back", set()) or key_obj == "W"
+
+        def is_month_forward(key_obj: object) -> bool:
+            return key_obj in config.keybinds.get("month_forward", set()) or key_obj == "m"
+
+        def is_month_back(key_obj: object) -> bool:
+            return key_obj in config.keybinds.get("month_back", set()) or key_obj == "M"
+
         if is_action(key, "quit"):
+            if state.display_mode == "calendar":
+                state.display_mode = "week"
+                focus_date(state, state.prev_week_focus)
+                status = "week view"
+                key_buffer.clear()
+                continue
             break
-        if is_action(key, "left"):
-            if state.config.view_mode == "week":
-                if state.cursor_day == 0:
-                    state.update_week_window(state.week_start - dt.timedelta(days=7), cursor_day=len(state.day_order) - 1)
-                else:
-                    state.cursor_day = state.cursor_day - 1
+        if is_action(key, "toggle_view"):
+            if state.display_mode == "calendar":
+                state.display_mode = "week"
+                focus_date(state, state.prev_week_focus)
+                status = "week view"
             else:
-                if state.cursor_day == 0:
-                    state.update_week_window(state.week_start - dt.timedelta(days=1), cursor_day=0)
+                state.prev_week_focus = state.current_date()
+                state.display_mode = "calendar"
+                status = "calendar view"
+            key_buffer.clear()
+            continue
+        if state.display_mode == "calendar":
+            allowed_actions = {"left", "right", "up", "down", "details", "toggle_view", "goto_prefix", "goto_date"}
+            if not (is_week_forward(key) or is_week_back(key) or is_month_forward(key) or is_month_back(key)):
+                matched = None
+                for action_name, keys in config.keybinds.items():
+                    if key in keys:
+                        matched = action_name
+                        break
+                if matched and matched not in allowed_actions:
+                    status = ""
+                    key_buffer.clear()
+                    continue
+        if is_action(key, "left"):
+            if state.display_mode == "calendar":
+                focus_date(state, state.current_date() - dt.timedelta(days=1))
+            else:
+                if state.config.view_mode == "week":
+                    if state.cursor_day == 0:
+                        state.update_week_window(state.week_start - dt.timedelta(days=7), cursor_day=len(state.day_order) - 1)
+                    else:
+                        state.cursor_day = state.cursor_day - 1
                 else:
-                    state.cursor_day = state.cursor_day - 1
+                    if state.cursor_day == 0:
+                        state.update_week_window(state.week_start - dt.timedelta(days=1), cursor_day=0)
+                    else:
+                        state.cursor_day = state.cursor_day - 1
             state.clamp_cursor()
             update_range_selection(state)
         elif is_action(key, "right"):
-            if state.config.view_mode == "week":
-                if state.cursor_day == len(state.day_order) - 1:
-                    state.update_week_window(state.week_start + dt.timedelta(days=7), cursor_day=0)
-                else:
-                    state.cursor_day = state.cursor_day + 1
+            if state.display_mode == "calendar":
+                focus_date(state, state.current_date() + dt.timedelta(days=1))
             else:
-                if state.cursor_day == len(state.day_order) - 1:
-                    state.update_week_window(state.week_start + dt.timedelta(days=1), cursor_day=len(state.day_order) - 1)
+                if state.config.view_mode == "week":
+                    if state.cursor_day == len(state.day_order) - 1:
+                        state.update_week_window(state.week_start + dt.timedelta(days=7), cursor_day=0)
+                    else:
+                        state.cursor_day = state.cursor_day + 1
                 else:
-                    state.cursor_day = state.cursor_day + 1
+                    if state.cursor_day == len(state.day_order) - 1:
+                        state.update_week_window(state.week_start + dt.timedelta(days=1), cursor_day=len(state.day_order) - 1)
+                    else:
+                        state.cursor_day = state.cursor_day + 1
             state.clamp_cursor()
             update_range_selection(state)
         elif is_action(key, "down"):
-            items = state.current_tasks()
-            if items:
-                state.cursor_idx = min(state.cursor_idx + 1, len(items) - 1)
+            if state.display_mode == "calendar":
+                focus_date(state, state.current_date() + dt.timedelta(days=7))
                 update_range_selection(state)
+            else:
+                items = state.current_tasks()
+                if items:
+                    state.cursor_idx = min(state.cursor_idx + 1, len(items) - 1)
+                    update_range_selection(state)
         elif is_action(key, "up"):
-            if state.cursor_idx > 0:
-                state.cursor_idx -= 1
+            if state.display_mode == "calendar":
+                focus_date(state, state.current_date() - dt.timedelta(days=7))
                 update_range_selection(state)
+            else:
+                if state.cursor_idx > 0:
+                    state.cursor_idx -= 1
+                    update_range_selection(state)
         elif is_action(key, "edit"):
             targets = [t for _, t in selected_entries(state)]
             if targets:
@@ -1858,13 +2042,19 @@ def main(stdscr: curses.window) -> None:
                 else:
                     status = "invalid date"
         elif is_action(key, "delete"):
-            pending_delete = True
-            status = "pending dd"
-            hold_buffer = True
+            if state.display_mode == "calendar":
+                status = "delete unavailable in calendar"
+            else:
+                pending_delete = True
+                status = "pending dd"
+                hold_buffer = True
         elif is_action(key, "copy"):
-            pending_copy = True
-            status = "pending yy"
-            hold_buffer = True
+            if state.display_mode == "calendar":
+                status = "copy unavailable in calendar"
+            else:
+                pending_copy = True
+                status = "pending yy"
+                hold_buffer = True
         elif is_action(key, "paste_after"):
             pasted = paste_task(state, before=False)
             if pasted:
@@ -1880,19 +2070,32 @@ def main(stdscr: curses.window) -> None:
             else:
                 status = "nothing to paste"
         elif is_action(key, "details"):
-            show_task_details(stdscr, state)
-            status = ""
-        elif is_action(key, "week_forward"):
-            step = 7 if state.config.view_mode == "week" else effective_window_days(state.config)
-            state.update_week_window(state.week_start + dt.timedelta(days=step))
+            if state.display_mode == "calendar":
+                state.display_mode = "week"
+                focus_date(state, state.current_date())
+                status = "week view"
+            else:
+                show_task_details(stdscr, state)
+                status = ""
+        elif is_week_forward(key):
+            step = 7 if state.display_mode == "calendar" else (7 if state.config.view_mode == "week" else effective_window_days(state.config))
+            focus_date(state, state.current_date() + dt.timedelta(days=step))
             state.cursor_idx = 0
-            state.clamp_cursor()
             update_range_selection(state)
-        elif is_action(key, "week_back"):
-            step = 7 if state.config.view_mode == "week" else effective_window_days(state.config)
-            state.update_week_window(state.week_start - dt.timedelta(days=step))
+        elif is_week_back(key):
+            step = 7 if state.display_mode == "calendar" else (7 if state.config.view_mode == "week" else effective_window_days(state.config))
+            focus_date(state, state.current_date() - dt.timedelta(days=step))
             state.cursor_idx = 0
-            state.clamp_cursor()
+            update_range_selection(state)
+        elif is_month_forward(key):
+            target = shift_month(state.current_date(), 1)
+            focus_date(state, target)
+            state.cursor_idx = 0
+            update_range_selection(state)
+        elif is_month_back(key):
+            target = shift_month(state.current_date(), -1)
+            focus_date(state, target)
+            state.cursor_idx = 0
             update_range_selection(state)
         elif is_action(key, "goto_prefix"):
             day_hints = " ".join(f"{i+1}:{day[:3]}" for i, day in enumerate(state.day_order))
@@ -1905,21 +2108,28 @@ def main(stdscr: curses.window) -> None:
                 first = ""
             key_buffer.append(format_key(first))
             draw(stdscr, state, f"{' '.join(key_buffer)} {day_hints} g:Today", show_help=False)
-            if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= len(state.day_order):
-                target_idx = int(first) - 1
-                state.cursor_day = target_idx % len(state.day_order)
-                state.clamp_cursor()
-                update_range_selection(state)
-                status = state.day_order[state.cursor_day]
-            elif first == "g":
-                target = state.today
-                new_start, new_idx, _ = window_for_date(target, state.config)
-                state.update_week_window(new_start, cursor_day=new_idx)
-                status = "today"
-            elif first in ("\x1b",):
-                status = ""
+            if state.display_mode == "calendar":
+                if first == "g":
+                    focus_date(state, state.today)
+                    status = "today"
+                else:
+                    status = ""
             else:
-                status = ""
+                if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= len(state.day_order):
+                    target_idx = int(first) - 1
+                    state.cursor_day = target_idx % len(state.day_order)
+                    state.clamp_cursor()
+                    update_range_selection(state)
+                    status = state.day_order[state.cursor_day]
+                elif first == "g":
+                    target = state.today
+                    new_start, new_idx, _ = window_for_date(target, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
+                    status = "today"
+                elif first in ("\x1b",):
+                    status = ""
+                else:
+                    status = ""
             key_buffer.clear()
         elif is_action(key, "jump_prefix"):
             day_hints = " ".join(f"{i+1}:{day[:3]}" for i, day in enumerate(state.day_order))
