@@ -86,6 +86,8 @@ class Config:
     archive_completed_after_days: int = 0
     save_debounce_seconds: float = 0.3
     expand_overflow_on_hover: bool = True
+    days_on_screen: int = 7
+    view_mode: str = "scroll"  # "scroll" or "week"
 
 
 SPECIAL_KEYS = {
@@ -135,6 +137,32 @@ def week_layout_for(start_on_sunday: bool) -> List[str]:
     if start_on_sunday:
         return ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     return list(DEFAULT_DAY_ORDER)
+
+
+def day_names_for(start_date: dt.date, days: int) -> List[str]:
+    names: List[str] = []
+    for i in range(days):
+        day = start_date + dt.timedelta(days=i)
+        names.append(DEFAULT_DAY_ORDER[day.weekday()])
+    return names
+
+
+def effective_window_days(config: Config) -> int:
+    return 7 if config.view_mode == "week" else max(1, config.days_on_screen)
+
+
+def window_for_date(target: dt.date, config: Config) -> tuple[dt.date, int, int]:
+    days = effective_window_days(config)
+    if config.view_mode == "week":
+        start = week_start_for(target, config.first_weekday)
+        idx = weekday_index(target, config.first_weekday)
+        return start, idx, days
+    if days == 1:
+        return target, 0, days
+    if days == 2:
+        return target, 0, days
+    start = target - dt.timedelta(days=1)
+    return start, 1, days
 
 
 def parse_csv_list(csv: str | None) -> List[str]:
@@ -210,6 +238,8 @@ def default_config() -> Config:
         archive_completed_after_days=0,
         save_debounce_seconds=0.3,
         expand_overflow_on_hover=True,
+        days_on_screen=5,
+        view_mode="scroll",
     )
 
 
@@ -334,6 +364,30 @@ def load_config() -> tuple[Config, list[str]]:
         errors.append(f"{prefix}expand_overflow_on_hover must be true/false; using true")
         expand_overflow_on_hover = True
 
+    days_on_screen = 7
+    if parser.has_section("general"):
+        raw_days = parser.get("general", "days_on_screen", fallback=None)
+        if raw_days:
+            ln = line_numbers.get(("general", "days_on_screen"))
+            try:
+                days_on_screen = max(1, int(raw_days))
+            except ValueError:
+                prefix = f"line {ln}: " if ln else ""
+                errors.append(f"{prefix}days_on_screen must be an integer; using 7")
+                days_on_screen = 7
+
+    view_mode = "scroll"
+    if parser.has_section("general"):
+        raw_mode = parser.get("general", "view_mode", fallback="scroll").strip().lower()
+        valid_modes = {"scroll", "week"}
+        if raw_mode in valid_modes:
+            view_mode = raw_mode
+        else:
+            ln = line_numbers.get(("general", "view_mode"))
+            prefix = f"line {ln}: " if ln else ""
+            errors.append(f"{prefix}view_mode must be 'scroll' or 'week'; using scroll")
+            view_mode = "scroll"
+
     def parse_bool(section: str, option: str, fallback: bool) -> bool:
         if not parser.has_section(section):
             return fallback
@@ -366,6 +420,8 @@ def load_config() -> tuple[Config, list[str]]:
         archive_completed_after_days=archive_after_days,
         save_debounce_seconds=save_debounce_seconds,
         expand_overflow_on_hover=expand_overflow_on_hover,
+        days_on_screen=days_on_screen,
+        view_mode=view_mode,
     ), []
 
 
@@ -433,6 +489,24 @@ class State:
     redo_stack: List[Snapshot] = field(default_factory=list)
     dirty: bool = False
     last_save_time: float = 0.0
+
+    def update_week_window(self, new_start: dt.date | None = None, cursor_day: int | None = None) -> None:
+        if new_start:
+            self.week_start = new_start
+        if not self.config:
+            return
+        days = effective_window_days(self.config)
+        start = self.week_start
+        if self.config.view_mode == "week":
+            start = week_start_for(start, self.first_weekday)
+        self.week_start = start
+        self.day_order = day_names_for(self.week_start, days)
+        max_idx = max(0, len(self.day_order) - 1)
+        if cursor_day is not None:
+            self.cursor_day = max(0, min(cursor_day, max_idx))
+        else:
+            self.cursor_day = max(0, min(self.cursor_day, max_idx))
+        self.clamp_cursor()
 
     def current_date(self) -> dt.date:
         return self.week_start + dt.timedelta(days=self.cursor_day)
@@ -1090,8 +1164,8 @@ def move_tasks_to_date(state: State, target_date: dt.date, tasks_to_move: List[T
         t.date = target_date
         dest_list.append(t)
     sort_tasks_for_date(state, target_date)
-    state.week_start = week_start_for(target_date, state.first_weekday)
-    state.cursor_day = weekday_index(target_date, state.first_weekday)
+    new_start, new_idx, _ = window_for_date(target_date, state.config)
+    state.update_week_window(new_start, cursor_day=new_idx)
     state.cursor_idx = 0
     state.clamp_cursor()
     mark_dirty(state)
@@ -1122,6 +1196,7 @@ def apply_snapshot(state: State, snap: Snapshot) -> None:
     state.selected_ids.clear()
     state.selection_mode = "none"
     state.selection_anchor = None
+    state.update_week_window(state.week_start, state.cursor_day)
     state.clamp_cursor()
 
 
@@ -1279,7 +1354,21 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
         return
     task = items[state.cursor_idx]
     height, width = stdscr.getmaxyx()
-    win_h, win_w, start_y, start_x = modal_geometry(stdscr)
+    body = task.visible_body().strip() or "(empty)"
+    wrapped = textwrap.wrap(body, width=max(20, (width - 6) // 2))
+    projects = projects_for_task(task)
+    content_rows = 4 + len(wrapped)  # due + blank + "Task:" + wrapped + trailing blank
+    if projects:
+        project = projects[0]
+        related = tasks_for_project(state, project)
+        completed = [t for t in related if t.done]
+        pending = [t for t in related if not t.done]
+        content_rows += len(pending) + len(completed) + 6  # header + blank + labels + spacer per section
+
+    win_h = min(max(6, content_rows + 2), height - 2)
+    win_w = min(width - 4, max(40, width // 2))
+    start_y = max(1, (height - win_h) // 2)
+    start_x = max(2, (width - win_w) // 2)
     win = curses.newwin(win_h, win_w, start_y, start_x)
     win.erase()
     win.border()
@@ -1288,11 +1377,12 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
 
     lines: list[str] = []
     lines.append(f"Due: {task.date.isoformat()} ({task.date.strftime('%A')})")
-    body = task.visible_body().strip() or "(empty)"
     lines.append("")
-    lines.append("Task:")
-    wrapped = textwrap.wrap(body, width=max(20, win_w - 8))
-    lines.extend([f"  - {w}" for w in wrapped])
+    if wrapped:
+        lines.append(f"Task: {wrapped[0]}")
+        lines.extend([f" {w}" for w in wrapped[1:]])
+    else:
+        lines.append("Task:")
     lines.append("")
 
     projects = projects_for_task(task)
@@ -1300,8 +1390,15 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
     for entry in lines:
         if row >= win_h - 2:
             break
-        attr = curses.A_BOLD if entry and not entry.startswith("  ") else 0
-        win.addnstr(row, 2, entry[: win_w - 4], win_w - 4, attr)
+        if entry.startswith("Task: "):
+            label = "Task:"
+            rest = entry[len("Task: ") :]
+            win.addnstr(row, 2, label, win_w - 4, curses.A_BOLD)
+            if rest and len(label) + 1 < win_w - 4:
+                win.addnstr(row, 2 + len(label) + 1, rest[: win_w - 4 - len(label) - 1], win_w - 4 - len(label) - 1)
+        else:
+            attr = curses.A_BOLD if entry and not entry.startswith("  ") else 0
+            win.addnstr(row, 2, entry[: win_w - 4], win_w - 4, attr)
         row += 1
 
     if projects and row < win_h - 3:
@@ -1323,12 +1420,15 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
                 attr |= curses.A_DIM
             return attr
 
-        win.addnstr(row, 2, f"Project: {proj_name}", win_w - 4, curses.A_BOLD)
+        prefix = "Part of project: "
+        win.addnstr(row, 2, prefix, win_w - 4, curses.A_BOLD)
+        if len(prefix) < win_w - 4:
+            win.addnstr(row, 2 + len(prefix), proj_name[: win_w - 4 - len(prefix)], win_w - 4 - len(prefix))
         row += 1
         if row < win_h - 2:
             win.addnstr(row, 2, "", win_w - 4)
             row += 1
-        sections = [("Pending:", pending), ("Completed:", completed)]
+        sections = [("Pending:", pending), ("Complete:", completed)]
         for label, bucket in sections:
             if row >= win_h - 2:
                 break
@@ -1340,21 +1440,8 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
                 text_line = f"- {t.display_text()}"
                 win.addnstr(row, 6, text_line[: win_w - 8], win_w - 8, task_attr(t))
                 row += 1
-            if label == "Pending:" and row < win_h - 2:
-                win.addnstr(row, 2, "", win_w - 4)
+            if row < win_h - 2:
                 row += 1
-
-    contexts = contexts_for_task(task)
-    if contexts and row < win_h - 2:
-        win.addnstr(row, 3, "", win_w - 6)
-        row += 1
-        win.addnstr(row, 2, "Contexts:", win_w - 4, curses.A_BOLD)
-        row += 1
-        for ctx in contexts:
-            if row >= win_h - 2:
-                break
-            win.addnstr(row, 4, f"- {ctx[: win_w - 8]}", win_w - 6)
-            row += 1
 
     win.refresh()
     kstate = KeyState()
@@ -1503,19 +1590,19 @@ def main(stdscr: curses.window) -> None:
     today = dt.date.today()
     overdue_changed = handle_overdue_tasks(tasks, today, config.move_overdue_to_today)
     if overdue_changed:
-        # If we move tasks to today at startup, persist once.
         save_tasks(tasks, config.todo_file)
-    today_idx = weekday_index(today, config.first_weekday)
+    week_start, today_idx, days = window_for_date(today, config)
     state = State(
         tasks=tasks,
-        week_start=week_start_for(today, config.first_weekday),
+        week_start=week_start,
         cursor_day=today_idx,
         today=today,
-        day_order=config.week_layout,
+        day_order=day_names_for(week_start, days),
         first_weekday=config.first_weekday,
         config=config,
         last_save_time=time.monotonic(),
     )
+    state.update_week_window(state.week_start, state.cursor_day)
     for d in list(state.tasks.keys()):
         sort_tasks_for_date(state, d)
 
@@ -1616,11 +1703,29 @@ def main(stdscr: curses.window) -> None:
         if is_action(key, "quit"):
             break
         if is_action(key, "left"):
-            state.cursor_day = (state.cursor_day - 1) % len(state.day_order)
+            if state.config.view_mode == "week":
+                if state.cursor_day == 0:
+                    state.update_week_window(state.week_start - dt.timedelta(days=7), cursor_day=len(state.day_order) - 1)
+                else:
+                    state.cursor_day = state.cursor_day - 1
+            else:
+                if state.cursor_day == 0:
+                    state.update_week_window(state.week_start - dt.timedelta(days=1), cursor_day=0)
+                else:
+                    state.cursor_day = state.cursor_day - 1
             state.clamp_cursor()
             update_range_selection(state)
         elif is_action(key, "right"):
-            state.cursor_day = (state.cursor_day + 1) % len(state.day_order)
+            if state.config.view_mode == "week":
+                if state.cursor_day == len(state.day_order) - 1:
+                    state.update_week_window(state.week_start + dt.timedelta(days=7), cursor_day=0)
+                else:
+                    state.cursor_day = state.cursor_day + 1
+            else:
+                if state.cursor_day == len(state.day_order) - 1:
+                    state.update_week_window(state.week_start + dt.timedelta(days=1), cursor_day=len(state.day_order) - 1)
+                else:
+                    state.cursor_day = state.cursor_day + 1
             state.clamp_cursor()
             update_range_selection(state)
         elif is_action(key, "down"):
@@ -1732,10 +1837,9 @@ def main(stdscr: curses.window) -> None:
             else:
                 target = parse_jump(text, state.today)
                 if target:
-                    state.week_start = week_start_for(target, state.first_weekday)
-                    state.cursor_day = weekday_index(target, state.first_weekday)
+                    new_start, new_idx, _ = window_for_date(target, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
                     state.cursor_idx = 0
-                    state.clamp_cursor()
                     status = target.isoformat()
                 else:
                     status = "invalid date"
@@ -1779,31 +1883,17 @@ def main(stdscr: curses.window) -> None:
             show_task_details(stdscr, state)
             status = ""
         elif is_action(key, "week_forward"):
-            state.week_start = state.week_start + dt.timedelta(days=7)
+            step = 7 if state.config.view_mode == "week" else effective_window_days(state.config)
+            state.update_week_window(state.week_start + dt.timedelta(days=step))
             state.cursor_idx = 0
             state.clamp_cursor()
             update_range_selection(state)
         elif is_action(key, "week_back"):
-            state.week_start = state.week_start - dt.timedelta(days=7)
+            step = 7 if state.config.view_mode == "week" else effective_window_days(state.config)
+            state.update_week_window(state.week_start - dt.timedelta(days=step))
             state.cursor_idx = 0
             state.clamp_cursor()
             update_range_selection(state)
-        elif is_action(key, "goto_date"):
-            key_buffer.clear()
-            draw(stdscr, state, show_help=False)
-            text = prompt_text(stdscr, "go to date", "")
-            if not text.strip():
-                status = ""
-            else:
-                target = parse_jump(text, state.today)
-                if target:
-                    state.week_start = week_start_for(target, state.first_weekday)
-                    state.cursor_day = weekday_index(target, state.first_weekday)
-                    state.cursor_idx = 0
-                    state.clamp_cursor()
-                    status = target.isoformat()
-                else:
-                    status = "invalid date"
         elif is_action(key, "goto_prefix"):
             day_hints = " ".join(f"{i+1}:{day[:3]}" for i, day in enumerate(state.day_order))
             hint_text = f"{' '.join(key_buffer)} {day_hints} g:Today".strip()
@@ -1815,7 +1905,7 @@ def main(stdscr: curses.window) -> None:
                 first = ""
             key_buffer.append(format_key(first))
             draw(stdscr, state, f"{' '.join(key_buffer)} {day_hints} g:Today", show_help=False)
-            if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= 7:
+            if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= len(state.day_order):
                 target_idx = int(first) - 1
                 state.cursor_day = target_idx % len(state.day_order)
                 state.clamp_cursor()
@@ -1823,9 +1913,8 @@ def main(stdscr: curses.window) -> None:
                 status = state.day_order[state.cursor_day]
             elif first == "g":
                 target = state.today
-                state.week_start = week_start_for(target, state.first_weekday)
-                state.cursor_day = weekday_index(target, state.first_weekday)
-                state.clamp_cursor()
+                new_start, new_idx, _ = window_for_date(target, state.config)
+                state.update_week_window(new_start, cursor_day=new_idx)
                 status = "today"
             elif first in ("\x1b",):
                 status = ""
@@ -1843,7 +1932,7 @@ def main(stdscr: curses.window) -> None:
                 first = ""
             key_buffer.append(format_key(first))
             draw(stdscr, state, f"{' '.join(key_buffer)} {day_hints} t:Today", show_help=False)
-            if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= 7:
+            if isinstance(first, str) and first.isdigit() and 1 <= int(first) <= len(state.day_order):
                 target_idx = int(first) - 1
                 target_date = state.week_start + dt.timedelta(days=target_idx)
             elif first == "t":
@@ -1869,8 +1958,8 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, q, 1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date, state.first_weekday)
-                    state.cursor_day = weekday_index(date, state.first_weekday)
+                    new_start, new_idx, _ = window_for_date(date, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
                     state.cursor_idx = idx
                     status = f"{q}"
                 else:
@@ -1884,8 +1973,8 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, q, -1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date, state.first_weekday)
-                    state.cursor_day = weekday_index(date, state.first_weekday)
+                    new_start, new_idx, _ = window_for_date(date, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
                     state.cursor_idx = idx
                     status = f"{q}"
                 else:
@@ -1897,8 +1986,8 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, state.search_query, 1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date, state.first_weekday)
-                    state.cursor_day = weekday_index(date, state.first_weekday)
+                    new_start, new_idx, _ = window_for_date(date, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
                     state.cursor_idx = idx
                     status = state.search_query
                 else:
@@ -1910,8 +1999,8 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, state.search_query, -1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date, state.first_weekday)
-                    state.cursor_day = weekday_index(date, state.first_weekday)
+                    new_start, new_idx, _ = window_for_date(date, state.config)
+                    state.update_week_window(new_start, cursor_day=new_idx)
                     state.cursor_idx = idx
                     status = state.search_query
                 else:

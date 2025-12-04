@@ -35,6 +35,8 @@ archive_file = ~/todo/archive.txt
 archive_completed_after_days = 0
 save_debounce_seconds = 0.3
 expand_overflow_on_hover = true
+days_on_screen = 5
+view_mode = scroll
 
 [colors]
 default_fg = white
@@ -77,6 +79,8 @@ Notes:
 - `archive_file` defaults to `archive.txt` alongside your `todo_file` if not set.
 - `save_debounce_seconds` batches disk writes; tasks always flush on exit or after the debounce window.
 - `expand_overflow_on_hover` wraps long task text over multiple lines when the cursor is on it.
+- `days_on_screen` controls how many consecutive days are shown at once (default 5); horizontal navigation scrolls the window day-by-day.
+- `view_mode` chooses `scroll` (shows yesterday/today/forward with `days_on_screen` and scrolls a day at the edges) or `week` (always a 7-day week; edges jump a full week).
 - Colors accept `black, red, green, yellow, blue, magenta, cyan, white, default` or an integer color ID if your terminal supports it.
 
 ## Core keys (defaults)
