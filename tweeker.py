@@ -11,7 +11,7 @@ from typing import Dict, List
 
 DEFAULT_DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TODO_FILE = Path("todo.txt")
-CONFIG_PATH = Path.home() / ".config" / "weekling" / "config.json"
+CONFIG_PATH = Path.home() / ".config" / "tweeker" / "config.json"
 
 COLOR_NAMES = {
     "black": curses.COLOR_BLACK,
@@ -522,7 +522,7 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
     required_width = max(MIN_WIDTH, MIN_COL_WIDTH * len(state.day_order))
     required_height = MIN_HEIGHT
     if width < required_width or height < required_height:
-        msg = f"weekling needs at least {required_width}x{required_height}. current: {width}x{height}"
+        msg = f"tweeker needs at least {required_width}x{required_height}. current: {width}x{height}"
         hint = "resize your terminal to continue"
         y = height // 2 - 1
         stdscr.addnstr(max(0, y), 1, msg[: max(0, width - 2)], max(0, width - 2), curses.A_BOLD)
@@ -1009,16 +1009,22 @@ def show_keybinds(stdscr: curses.window, config: Config) -> None:
         pass
 
 
+def modal_geometry(stdscr: curses.window) -> tuple[int, int, int, int]:
+    height, width = stdscr.getmaxyx()
+    win_h = min(height - 8, max(14, height * 2 // 3))
+    win_w = min(width - 8, max(40, int(width * 0.55)))
+    start_y = max(3, (height - win_h) // 2)
+    start_x = max(3, (width - win_w) // 2)
+    return win_h, win_w, start_y, start_x
+
+
 def show_task_details(stdscr: curses.window, state: State) -> None:
     items = state.current_tasks()
     if not items:
         return
     task = items[state.cursor_idx]
     height, width = stdscr.getmaxyx()
-    win_h = min(height - 8, max(14, height * 2 // 3))
-    win_w = min(width - 8, max(40, int(width * 0.55)))
-    start_y = max(3, (height - win_h) // 2)
-    start_x = max(3, (width - win_w) // 2)
+    win_h, win_w, start_y, start_x = modal_geometry(stdscr)
     win = curses.newwin(win_h, win_w, start_y, start_x)
     win.erase()
     win.border()
@@ -1103,6 +1109,46 @@ def show_task_details(stdscr: curses.window, state: State) -> None:
         pass
 
 
+def show_welcome_screen(stdscr: curses.window, state: State) -> None:
+    win_h, win_w, start_y, start_x = modal_geometry(stdscr)
+    win = curses.newwin(win_h, win_w, start_y, start_x)
+    win.erase()
+    win.border()
+    title = " Welcome to tweeker "
+    win.addnstr(0, max(1, (win_w - len(title)) // 2), title, len(title), curses.A_BOLD)
+
+    messages = [
+        "No tasks found in todo.txt.",
+        "Welcome! tweeker is a week-first, keyboard-driven task list. Keep a small, focused set of tasks per day and keep them moving forward.",
+        "",
+        "Core keys: h/l move days, j/k move tasks, o/O add below/above, i edit, x toggle done, +/- adjust priority, Enter shows details, q quits.",
+        "",
+        "Suggested flow: start on today, press o to add a few tasks, mark them done with x as you progress, jump between days with h/l, and keep priorities tight with +/- to stay focused.",
+        "Press any key to begin.",
+    ]
+    row = 2
+    wrap_width = max(20, win_w - 6)
+    for line in messages:
+        if row >= win_h - 2:
+            break
+        if line:
+            for segment in textwrap.wrap(line, width=wrap_width):
+                if row >= win_h - 2:
+                    break
+                win.addnstr(row, 3, segment, win_w - 6)
+                row += 1
+        else:
+            win.addnstr(row, 3, "", win_w - 6)
+            row += 1
+
+    win.refresh()
+    kstate = KeyState()
+    try:
+        return read_key(win, kstate)
+    except curses.error:
+        return None
+
+
 def handle_command(stdscr: curses.window, state: State, config: Config) -> str:
     draw(stdscr, state, show_help=False)
     text = prompt_text(stdscr, ":", "")
@@ -1183,6 +1229,8 @@ def main(stdscr: curses.window) -> None:
     for d in list(state.tasks.keys()):
         sort_tasks_for_date(state, d)
 
+    show_welcome = not tasks
+    welcome_shown = False
     pending_delete = False
     pending_copy = False
     status = ""
@@ -1219,7 +1267,7 @@ def main(stdscr: curses.window) -> None:
             if w >= min_w and h >= MIN_HEIGHT:
                 break
             stdscr.erase()
-            msg = f"weekling needs at least {min_w}x{MIN_HEIGHT}. current: {w}x{h}"
+            msg = f"tweeker needs at least {min_w}x{MIN_HEIGHT}. current: {w}x{h}"
             hint = "resize your terminal to continue"
             stdscr.addnstr(h // 2 - 1, max(0, (w - len(msg)) // 2), msg[: max(0, w - 1)], max(0, w - 1), curses.A_BOLD)
             stdscr.addnstr(h // 2, max(0, (w - len(hint)) // 2), hint[: max(0, w - 1)], max(0, w - 1))
@@ -1229,10 +1277,15 @@ def main(stdscr: curses.window) -> None:
             except curses.error:
                 continue
         draw(stdscr, state, status)
-        try:
-            key = read_key(stdscr, kstate, allow_repeat_keys=repeatable)
-        except curses.error:
-            continue
+        key = None
+        if show_welcome and not welcome_shown:
+            key = show_welcome_screen(stdscr, state)
+            welcome_shown = True
+        if key is None:
+            try:
+                key = read_key(stdscr, kstate, allow_repeat_keys=repeatable)
+            except curses.error:
+                continue
         key_buffer.append(format_key(key))
         status = ""
         hold_buffer = False
@@ -1583,7 +1636,7 @@ if __name__ == "__main__":
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            msg = "weekling needs a larger terminal. resize to continue."
+            msg = "tweeker needs a larger terminal. resize to continue."
             hint = f"Tip: try at least {max(MIN_WIDTH, MIN_COL_WIDTH * len(DEFAULT_DAY_ORDER))}x{MIN_HEIGHT}."
             stdscr.addnstr(h // 2 - 1, max(0, (w - len(msg)) // 2), msg, max(0, w - 1), curses.A_BOLD)
             stdscr.addnstr(h // 2, max(0, (w - len(hint)) // 2), hint, max(0, w - 1))
