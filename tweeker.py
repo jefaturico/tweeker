@@ -12,6 +12,7 @@ from typing import Dict, List
 DEFAULT_DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TODO_FILE = Path("todo.txt")
 CONFIG_PATH = Path.home() / ".config" / "tweeker" / "config.ini"
+DEFAULT_ARCHIVE_FILE = TODO_FILE.with_name("archive.txt")
 
 COLOR_NAMES = {
     "black": curses.COLOR_BLACK,
@@ -74,6 +75,7 @@ def default_colors() -> Dict[str, str]:
 class Config:
     keybinds: Dict[str, set]
     todo_file: Path
+    archive_file: Path
     default_fg: int
     highlight_fg: int
     unselected_dim: bool
@@ -81,6 +83,9 @@ class Config:
     first_weekday: int
     show_statusbar: bool = True
     move_overdue_to_today: bool = False
+    archive_completed_after_days: int = 0
+    save_debounce_seconds: float = 0.3
+    expand_overflow_on_hover: bool = True
 
 
 SPECIAL_KEYS = {
@@ -126,19 +131,16 @@ def load_parser_with_lines(path: Path) -> tuple[configparser.ConfigParser, dict[
     return parser, lines, None
 
 
-def normalize_week_layout(raw: List[str] | None) -> List[str]:
-    if not raw:
-        return list(DEFAULT_DAY_ORDER)
-    cleaned = []
-    for name in raw:
-        if not isinstance(name, str):
-            continue
-        title = name.strip().capitalize()
-        if title in DAY_NAME_TO_NUM:
-            cleaned.append(title)
-    if len(cleaned) == 7 and len(set(cleaned)) == 7:
-        return cleaned
+def week_layout_for(start_on_sunday: bool) -> List[str]:
+    if start_on_sunday:
+        return ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     return list(DEFAULT_DAY_ORDER)
+
+
+def parse_csv_list(csv: str | None) -> List[str]:
+    if not csv:
+        return []
+    return [item.strip() for item in csv.split(",") if item.strip()]
 
 
 MIN_COL_WIDTH = 12
@@ -189,7 +191,7 @@ def normalize_keybinds(raw: Dict[str, list] | None) -> Dict[str, set]:
 
 
 def default_config() -> Config:
-    week_layout = normalize_week_layout(None)
+    week_layout = week_layout_for(False)
     keybinds = normalize_keybinds(None)
     color_defaults = default_colors()
     default_fg = resolve_color(None, color_defaults["default_fg"])
@@ -197,6 +199,7 @@ def default_config() -> Config:
     return Config(
         keybinds=keybinds,
         todo_file=TODO_FILE,
+        archive_file=DEFAULT_ARCHIVE_FILE,
         default_fg=default_fg,
         highlight_fg=highlight_fg,
         unselected_dim=True,
@@ -204,6 +207,9 @@ def default_config() -> Config:
         first_weekday=DAY_NAME_TO_NUM.get(week_layout[0], 0),
         show_statusbar=True,
         move_overdue_to_today=False,
+        archive_completed_after_days=0,
+        save_debounce_seconds=0.3,
+        expand_overflow_on_hover=True,
     )
 
 
@@ -213,29 +219,22 @@ def load_config() -> tuple[Config, list[str]]:
     if load_error:
         errors.append(load_error)
 
-    def parse_list(csv: str | None) -> List[str] | None:
-        if not csv:
-            return None
-        return [item.strip() for item in csv.split(",") if item.strip()]
-
-    week_layout_raw = None
+    start_on_sunday = False
     if parser.has_section("general"):
-        week_layout_raw = parse_list(parser.get("general", "week_layout", fallback=None))
-    week_layout = normalize_week_layout(week_layout_raw)
-
-    if week_layout_raw:
-        cleaned = [name.strip().capitalize() for name in week_layout_raw]
-        valid = [name for name in cleaned if name in DAY_NAME_TO_NUM]
-        if len(valid) != 7 or len(set(valid)) != 7:
-            ln = line_numbers.get(("general", "week_layout"))
+        try:
+            start_on_sunday = parser.getboolean("general", "week_starts_on_sunday", fallback=False)
+        except ValueError:
+            ln = line_numbers.get(("general", "week_starts_on_sunday"))
             prefix = f"line {ln}: " if ln else ""
-            errors.append(f"{prefix}week_layout must list all seven unique day names; using default order")
+            errors.append(f"{prefix}week_starts_on_sunday must be true/false; using false")
+            start_on_sunday = False
+    week_layout = week_layout_for(start_on_sunday)
 
     raw_keybinds = None
     if parser.has_section("keybinds"):
         raw_keybinds = {}
         for action, tokens in parser.items("keybinds"):
-            raw_keybinds[action] = parse_list(tokens) or []
+            raw_keybinds[action] = parse_csv_list(tokens)
     keybinds = normalize_keybinds(raw_keybinds)
     conflicts = []
     owners: Dict[object, tuple[str, int | None]] = {}
@@ -285,6 +284,55 @@ def load_config() -> tuple[Config, list[str]]:
             except Exception as exc:
                 prefix = f"line {ln}: " if ln else ""
                 errors.append(f"{prefix}todo_file invalid ({exc}); using {TODO_FILE}")
+    archive_file = todo_file.with_name("archive.txt")
+    if parser.has_section("general"):
+        raw_path = parser.get("general", "archive_file", fallback=None)
+        if raw_path:
+            ln = line_numbers.get(("general", "archive_file"))
+            try:
+                candidate = Path(raw_path.strip()).expanduser()
+                if candidate.is_dir():
+                    prefix = f"line {ln}: " if ln else ""
+                    errors.append(f"{prefix}archive_file points to a directory; using {DEFAULT_ARCHIVE_FILE}")
+                else:
+                    archive_file = candidate
+            except Exception as exc:
+                prefix = f"line {ln}: " if ln else ""
+                errors.append(f"{prefix}archive_file invalid ({exc}); using {DEFAULT_ARCHIVE_FILE}")
+
+    archive_after_days = 0
+    if parser.has_section("general"):
+        raw_days = parser.get("general", "archive_completed_after_days", fallback=None)
+        if raw_days:
+            ln = line_numbers.get(("general", "archive_completed_after_days"))
+            try:
+                archive_after_days = max(0, int(raw_days))
+            except ValueError:
+                prefix = f"line {ln}: " if ln else ""
+                errors.append(f"{prefix}archive_completed_after_days must be an integer; using 0")
+                archive_after_days = 0
+
+    save_debounce_seconds = 0.3
+    if parser.has_section("general"):
+        raw = parser.get("general", "save_debounce_seconds", fallback=None)
+        if raw:
+            ln = line_numbers.get(("general", "save_debounce_seconds"))
+            try:
+                save_debounce_seconds = max(0.0, float(raw))
+            except ValueError:
+                prefix = f"line {ln}: " if ln else ""
+                errors.append(f"{prefix}save_debounce_seconds must be a number; using 0.3")
+                save_debounce_seconds = 0.3
+
+    expand_overflow_on_hover = True
+    expand_ln = line_numbers.get(("general", "expand_overflow_on_hover"))
+    expand_raw = parser.get("general", "expand_overflow_on_hover", fallback="true") if parser.has_section("general") else "true"
+    try:
+        expand_overflow_on_hover = parser.getboolean("general", "expand_overflow_on_hover", fallback=True)
+    except ValueError:
+        prefix = f"line {expand_ln}: " if expand_ln else ""
+        errors.append(f"{prefix}expand_overflow_on_hover must be true/false; using true")
+        expand_overflow_on_hover = True
 
     def parse_bool(section: str, option: str, fallback: bool) -> bool:
         if not parser.has_section(section):
@@ -307,6 +355,7 @@ def load_config() -> tuple[Config, list[str]]:
     return Config(
         keybinds=keybinds,
         todo_file=todo_file,
+        archive_file=archive_file,
         default_fg=default_fg,
         highlight_fg=highlight_fg,
         unselected_dim=unselected_dim,
@@ -314,6 +363,9 @@ def load_config() -> tuple[Config, list[str]]:
         first_weekday=first_weekday,
         show_statusbar=show_statusbar,
         move_overdue_to_today=move_overdue_to_today,
+        archive_completed_after_days=archive_after_days,
+        save_debounce_seconds=save_debounce_seconds,
+        expand_overflow_on_hover=expand_overflow_on_hover,
     ), []
 
 
@@ -379,6 +431,8 @@ class State:
     selection_anchor: int | None = None  # task id for range anchor
     undo_stack: List[Snapshot] = field(default_factory=list)
     redo_stack: List[Snapshot] = field(default_factory=list)
+    dirty: bool = False
+    last_save_time: float = 0.0
 
     def current_date(self) -> dt.date:
         return self.week_start + dt.timedelta(days=self.cursor_day)
@@ -395,6 +449,7 @@ class State:
 
 
 def load_tasks(todo_path: Path) -> Dict[dt.date, List[Task]]:
+    """Load tasks from the todo file path; tolerates missing files."""
     tasks: Dict[dt.date, List[Task]] = {}
     if not todo_path.exists():
         return tasks
@@ -426,6 +481,7 @@ def load_tasks(todo_path: Path) -> Dict[dt.date, List[Task]]:
 
 
 def save_tasks(tasks: Dict[dt.date, List[Task]], todo_path: Path) -> None:
+    """Persist tasks to the todo file path, creating parent directories as needed."""
     lines: List[str] = []
     for date in sorted(tasks.keys()):
         for task in tasks.get(date, []):
@@ -434,6 +490,27 @@ def save_tasks(tasks: Dict[dt.date, List[Task]], todo_path: Path) -> None:
             lines.append(task.to_line())
     todo_path.parent.mkdir(parents=True, exist_ok=True)
     todo_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def mark_dirty(state: State) -> None:
+    state.dirty = True
+
+
+def persist_tasks_if_needed(state: State, force: bool = False) -> None:
+    if not state.config:
+        return
+    now = time.monotonic()
+    should_save = force or (state.dirty and (now - state.last_save_time) >= state.config.save_debounce_seconds)
+    if not should_save:
+        return
+    if state.config.archive_completed_after_days > 0:
+        cutoff = dt.date.today() - dt.timedelta(days=state.config.archive_completed_after_days)
+        moved = archive_completed(state.tasks, state.config.archive_file, cutoff)
+        if moved:
+            state.dirty = True
+    save_tasks(state.tasks, state.config.todo_file)
+    state.last_save_time = time.monotonic()
+    state.dirty = False
 
 
 @dataclass
@@ -762,9 +839,19 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
                         attr = active_attr
                 if task.done:
                     attr |= curses.A_DIM
-                line = task.display_text()[: content_w].ljust(content_w)
-                stdscr.addnstr(y, start_x, line, content_w, attr)
-                y += 1
+                text = task.display_text()
+                is_hovered = is_active and original_idx == state.cursor_idx
+                pad_left = 1 if is_hovered else 0
+                usable_text_width = max(1, content_w - pad_left)
+                expanded = state.config.expand_overflow_on_hover and is_hovered and len(text) > usable_text_width
+                lines = textwrap.wrap(text, width=usable_text_width) if expanded else [text[:usable_text_width]]
+                for idx_line, line in enumerate(lines):
+                    if y >= height - 1:
+                        break
+                    prefix = " " if is_hovered else ""
+                    padded = f"{prefix}{line}".ljust(content_w)
+                    stdscr.addnstr(y, start_x, padded, content_w, attr)
+                    y += 1
             if y < height - 1:
                 y += 1  # spacer between blocks
 
@@ -787,13 +874,14 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
     week_text = f"Week {state.week_start.isocalendar()[1]:02d}"
     usable_width = max(0, inner_width - len(week_text) - 1)
     status_x = 2  # slight padding from left border
+    status_attr = (curses.color_pair(1) | curses.A_DIM)
     if state.config and state.config.show_statusbar:
-        stdscr.addnstr(status_y, status_x, status_line, usable_width, curses.color_pair(3))
+        stdscr.addnstr(status_y, status_x, status_line, usable_width, status_attr)
     elif status:
-        stdscr.addnstr(status_y, status_x, status_line, usable_width, curses.color_pair(3))
+        stdscr.addnstr(status_y, status_x, status_line, usable_width, status_attr)
     start_col = max(1, width - len(week_text) - 2)
     if start_col < width - 1:
-        stdscr.addnstr(status_y, start_col, week_text, min(len(week_text), width - 1 - start_col), curses.color_pair(3) | curses.A_BOLD)
+        stdscr.addnstr(status_y, start_col, week_text, min(len(week_text), width - 1 - start_col), status_attr | curses.A_BOLD)
     # bottom line below status
     try:
         stdscr.hline(height - 1, 1, curses.ACS_HLINE | (curses.color_pair(1) | curses.A_DIM), max(0, width - 2))
@@ -940,10 +1028,11 @@ def tasks_for_project(state: State, project: str) -> List[Task]:
     return hits
 
 
-def handle_overdue_tasks(tasks: Dict[dt.date, List[Task]], today: dt.date, move_to_today: bool) -> None:
+def handle_overdue_tasks(tasks: Dict[dt.date, List[Task]], today: dt.date, move_to_today: bool) -> bool:
     if not tasks:
-        return
+        return False
     today_list = tasks.setdefault(today, [])
+    changed = False
     for date in list(tasks.keys()):
         items = tasks.get(date, [])
         i = 0
@@ -954,10 +1043,37 @@ def handle_overdue_tasks(tasks: Dict[dt.date, List[Task]], today: dt.date, move_
                     task.date = today
                     today_list.append(task)
                     items.pop(i)
+                    changed = True
                     continue
             i += 1
         if not items:
             tasks.pop(date, None)
+            changed = True
+    return changed
+
+
+def archive_completed(tasks: Dict[dt.date, List[Task]], archive_path: Path, cutoff: dt.date) -> bool:
+    """Move completed tasks older than cutoff to archive file. Returns True if any moved."""
+    moved: list[str] = []
+    for date in list(tasks.keys()):
+        items = tasks.get(date, [])
+        keep = []
+        for task in items:
+            if task.done and task.date < cutoff:
+                moved.append(task.to_line())
+            else:
+                keep.append(task)
+        if keep:
+            tasks[date] = keep
+        else:
+            tasks.pop(date, None)
+    if not moved:
+        return False
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with archive_path.open("a", encoding="utf-8") as f:
+        for line in moved:
+            f.write(line.rstrip("\n") + "\n")
+    return True
 
 
 def move_tasks_to_date(state: State, target_date: dt.date, tasks_to_move: List[Task]) -> bool:
@@ -978,7 +1094,7 @@ def move_tasks_to_date(state: State, target_date: dt.date, tasks_to_move: List[T
     state.cursor_day = weekday_index(target_date, state.first_weekday)
     state.cursor_idx = 0
     state.clamp_cursor()
-    save_tasks(state.tasks, state.config.todo_file)
+    mark_dirty(state)
     return True
 
 
@@ -1385,7 +1501,10 @@ def main(stdscr: curses.window) -> None:
 
     tasks = load_tasks(config.todo_file)
     today = dt.date.today()
-    handle_overdue_tasks(tasks, today, config.move_overdue_to_today)
+    overdue_changed = handle_overdue_tasks(tasks, today, config.move_overdue_to_today)
+    if overdue_changed:
+        # If we move tasks to today at startup, persist once.
+        save_tasks(tasks, config.todo_file)
     today_idx = weekday_index(today, config.first_weekday)
     state = State(
         tasks=tasks,
@@ -1395,6 +1514,7 @@ def main(stdscr: curses.window) -> None:
         day_order=config.week_layout,
         first_weekday=config.first_weekday,
         config=config,
+        last_save_time=time.monotonic(),
     )
     for d in list(state.tasks.keys()):
         sort_tasks_for_date(state, d)
@@ -1471,7 +1591,7 @@ def main(stdscr: curses.window) -> None:
                 record_undo(state)
                 delete_tasks(state, targets)
                 clear_selection(state)
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
                 status = "deleted"
             else:
                 status = ""
@@ -1516,10 +1636,9 @@ def main(stdscr: curses.window) -> None:
             targets = [t for _, t in selected_entries(state)]
             if targets:
                 edit_tasks(stdscr, state, targets)
-                save_tasks(state.tasks, state.config.todo_file)
             else:
                 insert_or_edit(stdscr, state)
-                save_tasks(state.tasks, state.config.todo_file)
+            mark_dirty(state)
         elif is_action(key, "new_below"):
             targets = [t for _, t in selected_entries(state)]
             if targets:
@@ -1527,14 +1646,14 @@ def main(stdscr: curses.window) -> None:
             else:
                 items = state.tasks.setdefault(state.current_date(), [])
                 insert_at(stdscr, state, state.cursor_idx + 1 if items else 0)
-            save_tasks(state.tasks, state.config.todo_file)
+            mark_dirty(state)
         elif is_action(key, "new_above"):
             targets = [t for _, t in selected_entries(state)]
             if targets:
                 insert_relative_to_tasks(stdscr, state, targets, after=False)
             else:
                 insert_at(stdscr, state, state.cursor_idx if state.current_tasks() else 0)
-            save_tasks(state.tasks, state.config.todo_file)
+            mark_dirty(state)
         elif is_action(key, "toggle_done"):
             targets = [t for _, t in selected_entries(state)] or ([current_task(state)] if current_task(state) else [])
             if targets:
@@ -1542,7 +1661,7 @@ def main(stdscr: curses.window) -> None:
             for task in targets:
                 task.done = not task.done
                 sort_tasks_for_date(state, task.date, focus_task=task)
-            save_tasks(state.tasks, state.config.todo_file)
+            mark_dirty(state)
         elif is_action(key, "priority_up"):
             targets = [t for _, t in selected_entries(state)] or ([current_task(state)] if current_task(state) else [])
             if targets:
@@ -1551,7 +1670,7 @@ def main(stdscr: curses.window) -> None:
                 adjust_priority(task, -1)
                 sort_tasks_for_date(state, task.date, focus_task=task)
             if targets:
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
         elif is_action(key, "priority_down"):
             targets = [t for _, t in selected_entries(state)] or ([current_task(state)] if current_task(state) else [])
             if targets:
@@ -1560,7 +1679,7 @@ def main(stdscr: curses.window) -> None:
                 adjust_priority(task, 1)
                 sort_tasks_for_date(state, task.date, focus_task=task)
             if targets:
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
         elif is_action(key, "select_range"):
             cur = current_task(state)
             if not cur:
@@ -1589,7 +1708,7 @@ def main(stdscr: curses.window) -> None:
                 state.redo_stack.append(snapshot_state(state))
                 snap = state.undo_stack.pop()
                 apply_snapshot(state, snap)
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
                 status = "undone"
             else:
                 status = "nothing to undo"
@@ -1599,7 +1718,7 @@ def main(stdscr: curses.window) -> None:
                 state.undo_stack.append(snapshot_state(state))
                 snap = state.redo_stack.pop()
                 apply_snapshot(state, snap)
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
                 status = "redone"
             else:
                 status = "nothing to redo"
@@ -1645,14 +1764,14 @@ def main(stdscr: curses.window) -> None:
         elif is_action(key, "paste_after"):
             pasted = paste_task(state, before=False)
             if pasted:
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
                 status = "pasted"
             else:
                 status = "nothing to paste"
         elif is_action(key, "paste_before"):
             pasted = paste_task(state, before=True)
             if pasted:
-                save_tasks(state.tasks, state.config.todo_file)
+                mark_dirty(state)
                 status = "pasted"
             else:
                 status = "nothing to paste"
@@ -1802,6 +1921,10 @@ def main(stdscr: curses.window) -> None:
             key_buffer.clear()
         if not status and key_buffer:
             status = " ".join(key_buffer)
+
+        persist_tasks_if_needed(state)
+
+    persist_tasks_if_needed(state, force=True)
 
 
 if __name__ == "__main__":
