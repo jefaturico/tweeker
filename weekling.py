@@ -2,17 +2,186 @@ from __future__ import annotations
 
 import curses
 import datetime as dt
+import json
+import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
-DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DEFAULT_DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TODO_FILE = Path("todo.txt")
+CONFIG_PATH = Path.home() / ".config" / "weekling" / "config.json"
+
+COLOR_NAMES = {
+    "black": curses.COLOR_BLACK,
+    "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN,
+    "yellow": curses.COLOR_YELLOW,
+    "blue": curses.COLOR_BLUE,
+    "magenta": curses.COLOR_MAGENTA,
+    "cyan": curses.COLOR_CYAN,
+    "white": curses.COLOR_WHITE,
+    "default": -1,
+    "none": -1,
+}
 
 
-def week_start_for(date: dt.date) -> dt.date:
-    return date - dt.timedelta(days=date.weekday())
+def default_keybinds() -> Dict[str, list]:
+    return {
+        "quit": ["q"],
+        "left": ["h", "KEY_LEFT"],
+        "right": ["l", "KEY_RIGHT"],
+        "down": ["j", "KEY_DOWN"],
+        "up": ["k", "KEY_UP"],
+        "edit": ["i"],
+        "new_below": ["o"],
+        "new_above": ["O"],
+        "toggle_done": ["x"],
+        "priority_up": ["+"],
+        "priority_down": ["-"],
+        "delete": ["d"],
+        "copy": ["y"],
+        "paste_after": ["p"],
+        "paste_before": ["P"],
+        "week_forward": ["w"],
+        "week_back": ["b"],
+        "goto_prefix": ["g", "G"],
+        "search_forward": ["/"],
+        "search_backward": ["?"],
+        "search_next": ["n"],
+        "search_prev": ["N"],
+        "command": [":"],
+        "details": ["\n", "KEY_ENTER"],
+    }
+
+
+def default_colors() -> Dict[str, str]:
+    return {
+        "default_fg": "white",
+        "highlight_fg": "cyan",
+        "unselected_dim": True,
+    }
+
+
+@dataclass
+class Config:
+    keybinds: Dict[str, set]
+    default_fg: int
+    highlight_fg: int
+    unselected_dim: bool
+    week_layout: List[str]
+    first_weekday: int
+    show_statusbar: bool = True
+    move_overdue_to_today: bool = False
+
+
+SPECIAL_KEYS = {
+    "KEY_LEFT": curses.KEY_LEFT,
+    "KEY_RIGHT": curses.KEY_RIGHT,
+    "KEY_UP": curses.KEY_UP,
+    "KEY_DOWN": curses.KEY_DOWN,
+    "ESC": "\x1b",
+    "ENTER": "\n",
+}
+
+DAY_NAME_TO_NUM = {name: idx for idx, name in enumerate(DEFAULT_DAY_ORDER)}
+
+
+def normalize_week_layout(raw: List[str] | None) -> List[str]:
+    if not raw:
+        return list(DEFAULT_DAY_ORDER)
+    cleaned = []
+    for name in raw:
+        if not isinstance(name, str):
+            continue
+        title = name.strip().capitalize()
+        if title in DAY_NAME_TO_NUM:
+            cleaned.append(title)
+    if len(cleaned) == 7 and len(set(cleaned)) == 7:
+        return cleaned
+    return list(DEFAULT_DAY_ORDER)
+
+
+def resolve_color(value: str | int | None, fallback: str | int) -> int:
+    candidate = fallback if value is None else value
+    if isinstance(candidate, int):
+        return candidate
+    if isinstance(candidate, str):
+        key = candidate.strip().lower()
+        if key in COLOR_NAMES:
+            return COLOR_NAMES[key]
+        try:
+            return int(key)
+        except ValueError:
+            pass
+    return COLOR_NAMES["default"]
+
+
+def normalize_key_token(token: object) -> object:
+    if isinstance(token, int):
+        return token
+    if isinstance(token, str):
+        trimmed = token.strip()
+        if len(trimmed) == 1:
+            return trimmed
+        upper = trimmed.upper()
+        if upper in SPECIAL_KEYS:
+            return SPECIAL_KEYS[upper]
+    return None
+
+
+def normalize_keybinds(raw: Dict[str, list] | None) -> Dict[str, set]:
+    merged: Dict[str, set] = {}
+    for action, tokens in default_keybinds().items():
+        merged[action] = set()
+        incoming = tokens
+        if raw and action in raw and isinstance(raw[action], list):
+            incoming = raw[action]
+        for tok in incoming:
+            resolved = normalize_key_token(tok)
+            if resolved is not None:
+                merged[action].add(resolved)
+    return merged
+
+
+def load_config() -> Config:
+    data = {}
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            data = {}
+    week_layout = normalize_week_layout(data.get("week_layout"))
+    keybinds = normalize_keybinds(data.get("keybinds"))
+    color_defaults = default_colors()
+    overrides = data.get("colors", {}) if isinstance(data.get("colors"), dict) else {}
+    default_fg = resolve_color(overrides.get("default_fg"), color_defaults["default_fg"])
+    highlight_fg = resolve_color(overrides.get("highlight_fg"), color_defaults["highlight_fg"])
+    unselected_raw = overrides.get("unselected_dim", color_defaults["unselected_dim"])
+    unselected_dim = bool(unselected_raw) if isinstance(unselected_raw, (bool, int)) else True
+    first_weekday = DAY_NAME_TO_NUM.get(week_layout[0], 0)
+    show_statusbar = bool(data.get("show_statusbar", True))
+    move_overdue_to_today = bool(data.get("move_overdue_to_today", False))
+    return Config(
+        keybinds=keybinds,
+        default_fg=default_fg,
+        highlight_fg=highlight_fg,
+        unselected_dim=unselected_dim,
+        week_layout=week_layout,
+        first_weekday=first_weekday,
+        show_statusbar=show_statusbar,
+        move_overdue_to_today=move_overdue_to_today,
+    )
+
+
+def week_start_for(date: dt.date, first_weekday: int = 0) -> dt.date:
+    delta = (date.weekday() - first_weekday) % 7
+    return date - dt.timedelta(days=delta)
+
+
+def weekday_index(date: dt.date, first_weekday: int = 0) -> int:
+    return (date.weekday() - first_weekday) % 7
 
 
 @dataclass
@@ -51,6 +220,10 @@ class State:
     today: dt.date = field(default_factory=dt.date.today)
     search_query: str | None = None
     search_dir: int = 1
+    day_order: List[str] = field(default_factory=lambda: list(DEFAULT_DAY_ORDER))
+    first_weekday: int = 0
+    yank: Task | None = None
+    config: Config | None = None
 
     def current_date(self) -> dt.date:
         return self.week_start + dt.timedelta(days=self.cursor_day)
@@ -137,7 +310,10 @@ def prompt_text(stdscr: curses.window, label: str, initial: str = "") -> str:
     stdscr.move(height - 1, 0)
     stdscr.clrtoeol()
 
-    prefix = f"{label}: "
+    if label.endswith(":"):
+        prefix = f"{label} "
+    else:
+        prefix = f"{label}: "
     win = curses.newwin(1, width, height - 1, 0)
     win.keypad(True)
 
@@ -180,8 +356,8 @@ def prompt_text(stdscr: curses.window, label: str, initial: str = "") -> str:
         if key == curses.KEY_END:
             pos = len(text)
             continue
-        if key == "\x1b":  # Esc cancels edits
-            text = list(initial)
+        if key == "\x1b":  # Esc cancels edits immediately
+            text = []
             break
         if isinstance(key, str) and key.isprintable():
             text.insert(pos, key)
@@ -245,7 +421,17 @@ def sort_tasks_for_date(state: State, date: dt.date, focus_task: Task | None = N
     if not items:
         return
     original_order = {id(task): i for i, task in enumerate(items)}
-    items.sort(key=lambda t: (1 if t.done else 0, priority_value(t.priority), original_order.get(id(t), 0)))
+    def sort_key(t: Task) -> tuple:
+        ctx = context_key(t)
+        ctx_label = ctx[1:] if ctx and ctx.startswith("@") else (ctx or "")
+        return (
+            ctx_label.lower(),
+            1 if t.done else 0,
+            priority_value(t.priority),
+            original_order.get(id(t), 0),
+        )
+
+    items.sort(key=sort_key)
     if focus_task:
         for i, t in enumerate(items):
             if t is focus_task:
@@ -286,9 +472,9 @@ def find_match(state: State, query: str, direction: int, skip_current: bool = Tr
     return None
 
 
-def project_key(task: Task) -> str:
+def context_key(task: Task) -> str:
     for word in task.text.split():
-        if word.startswith("+") and len(word) > 1:
+        if word.startswith("@") and len(word) > 1:
             return word
     return None
 
@@ -306,21 +492,18 @@ def adjust_priority(task: Task, delta: int) -> None:
 def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool = True) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    col_width = max(14, width // len(DAY_ORDER))
+    col_width = max(14, width // len(state.day_order))
     base_y = 4
 
-    for idx, day in enumerate(DAY_ORDER):
+    for idx, day in enumerate(state.day_order):
         x = idx * col_width
         date = state.week_start + dt.timedelta(days=idx)
         is_today = date == state.today
         is_active = idx == state.cursor_day
-        header_attr = curses.A_BOLD | curses.color_pair(3)
-        if is_today and is_active:
-            header_attr = curses.A_BOLD | curses.color_pair(4)
-        elif is_today:
-            header_attr = curses.A_BOLD | curses.color_pair(4)
-        elif is_active:
-            header_attr = curses.A_BOLD | curses.color_pair(5)
+        base_attr = curses.color_pair(2 if is_today else 1)
+        if not is_active and state.config and state.config.unselected_dim:
+            base_attr |= curses.A_DIM
+        header_attr = base_attr | curses.A_BOLD
         stdscr.addnstr(0, x, date.isoformat().center(col_width - 1), col_width - 1, header_attr)
         stdscr.addnstr(1, x, day.center(col_width - 1), col_width - 1, header_attr)
 
@@ -329,7 +512,7 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
         seen_projects: list[str] = []
         grouped: list[tuple[str, list[tuple[Task, int]]]] = []
         for idx_t, t in enumerate(tasks):
-            key = project_key(t)
+            key = context_key(t)
             if key is None:
                 no_project.append((t, idx_t))
                 continue
@@ -349,19 +532,21 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
             label_text = (label or "").strip()
             if label_text:
                 label_line = label_text.center(col_width - 1)
-                stdscr.addnstr(y, x, label_line, col_width - 1, curses.color_pair(3) | curses.A_BOLD)
+                stdscr.addnstr(y, x, label_line, col_width - 1, base_attr | curses.A_BOLD)
                 y += 1
             for task, original_idx in items:
                 if y >= height - 1:
                     break
-                attr = curses.A_DIM
-                if is_today:
-                    attr = curses.color_pair(1)
+                attr = base_attr
+                is_overdue = not task.done and task.date < state.today
+                if is_overdue:
+                    attr = curses.color_pair(4)
                 if is_active and original_idx == state.cursor_idx:
-                    if is_today:
+                    if is_overdue:
                         attr = curses.color_pair(4) | curses.A_BOLD | curses.A_STANDOUT
                     else:
-                        attr = curses.color_pair(5) | curses.A_BOLD | curses.A_STANDOUT
+                        active_attr = curses.color_pair(2 if is_today else 1) | curses.A_BOLD | curses.A_STANDOUT
+                        attr = active_attr
                 if task.done:
                     attr |= curses.A_DIM
                 line = task.display_text()[: col_width - 1].ljust(col_width - 1)
@@ -374,19 +559,25 @@ def draw(stdscr: curses.window, state: State, status: str = "", show_help: bool 
         if no_project:
             draw_block("", no_project)
         for proj, items in grouped:
-            label = proj[1:] if proj.startswith("+") else proj
+            label = proj[1:] if proj.startswith("@") else proj
             draw_block(label, items)
 
 
-    base_help = "h/l day  j/k task  i edit  o/O new  dd delete  x done  +/- prio  w/b week  g goto  / ? search  n/N next  q quit"
+    base_help = "q quit  h/l day  j/k task  o/O new  dd delete  yy copy  g goto  :help"
     status_line = "" if not show_help and not status else (status or base_help)
+    if state.config and not state.config.show_statusbar and not status:
+        stdscr.refresh()
+        return
     stdscr.move(height - 1, 0)
     stdscr.clrtoeol()
-    week_text = f"W{state.week_start.isocalendar()[1]:02d}"
+    week_text = f"Week {state.week_start.isocalendar()[1]:02d}"
     usable_width = max(0, width - len(week_text) - 1)
-    stdscr.addnstr(height - 1, 0, status_line, usable_width, curses.A_REVERSE)
+    if state.config and state.config.show_statusbar:
+        stdscr.addnstr(height - 1, 0, status_line, usable_width, curses.color_pair(3))
+    elif status:
+        stdscr.addnstr(height - 1, 0, status_line, usable_width, curses.color_pair(3))
     start_col = max(0, width - len(week_text) - 1)
-    stdscr.addnstr(height - 1, start_col, week_text, len(week_text), curses.A_REVERSE)
+    stdscr.addnstr(height - 1, start_col, week_text, len(week_text), curses.color_pair(3) | curses.A_BOLD)
     stdscr.refresh()
 
 
@@ -412,12 +603,201 @@ def insert_or_edit(stdscr: curses.window, state: State) -> None:
     sort_tasks_for_date(state, target_date, focus_task=focus)
 
 
-def delete_current(state: State) -> None:
+def delete_current(state: State) -> Task | None:
+    items = state.current_tasks()
+    if not items:
+        return None
+    removed = items.pop(state.cursor_idx)
+    state.clamp_cursor()
+    return removed
+
+
+def yank_current(state: State) -> None:
     items = state.current_tasks()
     if not items:
         return
-    items.pop(state.cursor_idx)
-    state.clamp_cursor()
+    task = items[state.cursor_idx]
+    state.yank = Task(date=state.current_date(), text=task.text, done=task.done, priority=task.priority)
+
+
+def paste_task(state: State, *, before: bool) -> Task | None:
+    if state.yank is None:
+        return None
+    items = state.tasks.setdefault(state.current_date(), [])
+    clone = Task(
+        date=state.current_date(),
+        text=state.yank.text,
+        done=state.yank.done,
+        priority=state.yank.priority,
+    )
+    insert_at = state.cursor_idx if before else state.cursor_idx + 1
+    insert_at = max(0, min(insert_at, len(items)))
+    items.insert(insert_at, clone)
+    sort_tasks_for_date(state, state.current_date(), focus_task=clone)
+    return clone
+
+
+def contexts_for_task(task: Task) -> List[str]:
+    return [w for w in task.text.split() if w.startswith("@") and len(w) > 1]
+
+
+def tasks_for_context(state: State, context: str) -> List[Task]:
+    hits: list[Task] = []
+    for tasks in state.tasks.values():
+        for t in tasks:
+            if context in contexts_for_task(t):
+                hits.append(t)
+    return hits
+
+
+def handle_overdue_tasks(tasks: Dict[dt.date, List[Task]], today: dt.date, move_to_today: bool) -> None:
+    if not tasks:
+        return
+    today_list = tasks.setdefault(today, [])
+    for date in list(tasks.keys()):
+        items = tasks.get(date, [])
+        i = 0
+        while i < len(items):
+            task = items[i]
+            if not task.done and task.date < today:
+                if move_to_today:
+                    task.date = today
+                    today_list.append(task)
+                    items.pop(i)
+                    continue
+            i += 1
+        if not items:
+            tasks.pop(date, None)
+
+
+def format_key(token: object) -> str:
+    reverse_special = {v: k.lower() for k, v in SPECIAL_KEYS.items()}
+    if isinstance(token, str):
+        if token == "\n":
+            return "enter"
+        if token == "\x1b":
+            return "esc"
+        return token
+    if isinstance(token, int):
+        if token in reverse_special:
+            return reverse_special[token]
+        return f"key-{token}"
+    return "?"
+
+
+def show_keybinds(stdscr: curses.window, config: Config) -> None:
+    height, width = stdscr.getmaxyx()
+    win = curses.newwin(height, width, 0, 0)
+    win.erase()
+    win.border()
+    title = " keybinds (press any key to close) "
+    win.addnstr(0, max(1, (width - len(title)) // 2), title, len(title), curses.A_BOLD)
+    friendly_names = {
+        "quit": "quit",
+        "left": "move day left",
+        "right": "move day right",
+        "down": "next task",
+        "up": "prev task",
+        "edit": "edit task",
+        "new_below": "new task below",
+        "new_above": "new task above",
+        "toggle_done": "toggle done",
+        "priority_up": "priority up",
+        "priority_down": "priority down",
+        "delete": "delete (dd)",
+        "copy": "copy (yy)",
+        "paste_after": "paste after",
+        "paste_before": "paste before",
+        "week_forward": "next week",
+        "week_back": "prev week",
+        "goto_prefix": "goto",
+        "search_forward": "search forward",
+        "search_backward": "search backward",
+        "search_next": "next match",
+        "search_prev": "prev match",
+        "command": "command (:)",
+    }
+    actions = list(config.keybinds.items())
+    actions.sort(key=lambda pair: pair[0])
+    row = 1
+    for action, keys in actions:
+        if row >= height - 2:
+            break
+        label = friendly_names.get(action, action).ljust(18)
+        key_text = ", ".join(format_key(k) for k in sorted(keys, key=str))
+        win.addnstr(row, 2, f"{label} {key_text}", width - 4)
+        row += 1
+    win.refresh()
+    kstate = KeyState()
+    try:
+        read_key(win, kstate)
+    except curses.error:
+        pass
+
+
+def show_task_details(stdscr: curses.window, state: State) -> None:
+    items = state.current_tasks()
+    if not items:
+        return
+    task = items[state.cursor_idx]
+    height, width = stdscr.getmaxyx()
+    win = curses.newwin(height, width, 0, 0)
+    win.erase()
+    win.border()
+    title = " task details (press any key to close) "
+    win.addnstr(0, max(1, (width - len(title)) // 2), title, len(title), curses.A_BOLD)
+
+    lines: list[str] = []
+    lines.append(f"Due: {task.date.isoformat()} ({task.date.strftime('%A')})")
+    lines.append(f"Created: {task.date.isoformat()}")
+    body = task.text.strip()
+    if not body:
+        body = "(empty)"
+    lines.append("Text:")
+    wrapped = textwrap.wrap(body, width=max(20, width - 6))
+    lines.extend([f"  {w}" for w in wrapped])
+
+    contexts = contexts_for_task(task)
+    if contexts:
+        lines.append("Contexts:")
+        for ctx in contexts:
+            lines.append(f"  {ctx}")
+    else:
+        lines.append("Contexts: none")
+
+    if contexts:
+        lines.append("Context overview:")
+        for ctx in contexts:
+            related = tasks_for_context(state, ctx)
+            done = sum(1 for t in related if t.done)
+            pending = sum(1 for t in related if not t.done)
+            lines.append(f"  {ctx}: {pending} pending, {done} done")
+
+    row = 1
+    for entry in lines:
+        if row >= height - 1:
+            break
+        win.addnstr(row, 2, entry[: width - 4], width - 4)
+        row += 1
+
+    win.refresh()
+    kstate = KeyState()
+    try:
+        read_key(win, kstate)
+    except curses.error:
+        pass
+
+
+def handle_command(stdscr: curses.window, state: State, config: Config) -> str:
+    draw(stdscr, state, show_help=False)
+    text = prompt_text(stdscr, ":", "")
+    cmd = text.strip().lower()
+    if not cmd:
+        return ""
+    if cmd in {"help", "h", "keys", "keybinds", ":help"}:
+        show_keybinds(stdscr, config)
+        return "help"
+    return f"unknown command: {cmd}"
 
 
 def insert_at(stdscr: curses.window, state: State, idx: int) -> None:
@@ -433,126 +813,211 @@ def insert_at(stdscr: curses.window, state: State, idx: int) -> None:
 
 
 def main(stdscr: curses.window) -> None:
+    config = load_config()
     curses.curs_set(0)
     curses.use_default_colors()
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)  # today tint (text)
-    curses.init_pair(2, curses.COLOR_WHITE, -1)  # selection text
-    curses.init_pair(3, curses.COLOR_WHITE, -1)  # headers/labels subtle
-    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN)  # today header bg
-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)  # active header bg (grey)
+    curses.init_pair(1, config.default_fg, -1)  # default text
+    curses.init_pair(2, config.highlight_fg, -1)  # highlight text (today column + selection)
+    curses.init_pair(3, config.default_fg, -1)  # status bar / misc
+    curses.init_pair(4, curses.COLOR_RED, -1)  # overdue tasks
     stdscr.keypad(True)
 
     tasks = load_tasks()
     today = dt.date.today()
-    today_idx = today.weekday()
-    state = State(tasks=tasks, week_start=week_start_for(today), cursor_day=today_idx, today=today)
+    handle_overdue_tasks(tasks, today, config.move_overdue_to_today)
+    today_idx = weekday_index(today, config.first_weekday)
+    state = State(
+        tasks=tasks,
+        week_start=week_start_for(today, config.first_weekday),
+        cursor_day=today_idx,
+        today=today,
+        day_order=config.week_layout,
+        first_weekday=config.first_weekday,
+        config=config,
+    )
     for d in list(state.tasks.keys()):
         sort_tasks_for_date(state, d)
 
     pending_delete = False
+    pending_copy = False
     status = ""
     kstate = KeyState()
+    key_buffer: List[str] = []
+
+    def is_action(key: object, action: str) -> bool:
+        return key in config.keybinds.get(action, set())
+
+    repeatable = (
+        config.keybinds.get("delete", set())
+        | config.keybinds.get("copy", set())
+        | config.keybinds.get("goto_prefix", set())
+    )
+
     while True:
         draw(stdscr, state, status)
         try:
-            key = read_key(stdscr, kstate, allow_repeat_keys={"d"})
+            key = read_key(stdscr, kstate, allow_repeat_keys=repeatable)
         except curses.error:
             continue
+        key_buffer.append(format_key(key))
+        status = ""
+        hold_buffer = False
 
         if pending_delete:
             pending_delete = False
-            if key == "d":
+            if is_action(key, "delete"):
+                yank_current(state)
                 delete_current(state)
                 save_tasks(state.tasks)
                 status = "deleted"
             else:
                 status = ""
+            key_buffer.clear()
             continue
 
-        status = ""
-        if key in ("q", "\x1b"):
+        if pending_copy:
+            pending_copy = False
+            if is_action(key, "copy"):
+                yank_current(state)
+                status = "copied"
+            key_buffer.clear()
+            continue
+
+        if is_action(key, "quit"):
             break
-        if key == "h":
-            state.cursor_day = (state.cursor_day - 1) % len(DAY_ORDER)
+        if is_action(key, "left"):
+            state.cursor_day = (state.cursor_day - 1) % len(state.day_order)
             state.clamp_cursor()
-        elif key == "l":
-            state.cursor_day = (state.cursor_day + 1) % len(DAY_ORDER)
+        elif is_action(key, "right"):
+            state.cursor_day = (state.cursor_day + 1) % len(state.day_order)
             state.clamp_cursor()
-        elif key == "j":
+        elif is_action(key, "down"):
             items = state.current_tasks()
             if items:
                 state.cursor_idx = min(state.cursor_idx + 1, len(items) - 1)
-        elif key == "k":
+        elif is_action(key, "up"):
             if state.cursor_idx > 0:
                 state.cursor_idx -= 1
-        elif key == "i":
+        elif is_action(key, "edit"):
             insert_or_edit(stdscr, state)
             save_tasks(state.tasks)
-        elif key == "o":
+        elif is_action(key, "new_below"):
             items = state.tasks.setdefault(state.current_date(), [])
             insert_at(stdscr, state, state.cursor_idx + 1 if items else 0)
             save_tasks(state.tasks)
-        elif key == "O":
+        elif is_action(key, "new_above"):
             insert_at(stdscr, state, state.cursor_idx if state.current_tasks() else 0)
             save_tasks(state.tasks)
-        elif key == "x":
+        elif is_action(key, "toggle_done"):
             items = state.current_tasks()
             if items:
                 task = items[state.cursor_idx]
                 task.done = not task.done
                 sort_tasks_for_date(state, state.current_date(), focus_task=task)
                 save_tasks(state.tasks)
-        elif key == "+":
+        elif is_action(key, "priority_up"):
             items = state.current_tasks()
             if items:
                 task = items[state.cursor_idx]
                 adjust_priority(task, -1)
                 sort_tasks_for_date(state, state.current_date(), focus_task=task)
                 save_tasks(state.tasks)
-        elif key == "-":
+        elif is_action(key, "priority_down"):
             items = state.current_tasks()
             if items:
                 task = items[state.cursor_idx]
                 adjust_priority(task, 1)
                 sort_tasks_for_date(state, state.current_date(), focus_task=task)
                 save_tasks(state.tasks)
-        elif key == "d":
+        elif is_action(key, "delete"):
             pending_delete = True
             status = "pending dd"
-        elif key == "w":
+            hold_buffer = True
+        elif is_action(key, "copy"):
+            pending_copy = True
+            status = "pending yy"
+            hold_buffer = True
+        elif is_action(key, "paste_after"):
+            pasted = paste_task(state, before=False)
+            if pasted:
+                save_tasks(state.tasks)
+                status = "pasted"
+            else:
+                status = "nothing to paste"
+        elif is_action(key, "paste_before"):
+            pasted = paste_task(state, before=True)
+            if pasted:
+                save_tasks(state.tasks)
+                status = "pasted"
+            else:
+                status = "nothing to paste"
+        elif is_action(key, "details"):
+            show_task_details(stdscr, state)
+            status = ""
+        elif is_action(key, "week_forward"):
             state.week_start = state.week_start + dt.timedelta(days=7)
             state.cursor_idx = 0
             state.clamp_cursor()
-        elif key == "b":
+        elif is_action(key, "week_back"):
             state.week_start = state.week_start - dt.timedelta(days=7)
             state.cursor_idx = 0
             state.clamp_cursor()
-        elif key == "g":
-            draw(stdscr, state, show_help=False)
-            prompt_state = KeyState()
-            try:
-                first = read_key(stdscr, prompt_state, allow_repeat_keys={"g"})
-            except curses.error:
-                first = ""
-            if first == "g":
-                target = state.today
-                state.week_start = week_start_for(target)
-                state.cursor_day = target.weekday()
-                state.clamp_cursor()
-                status = "today"
-            else:
-                initial = first if isinstance(first, str) and first not in ("\n", "\r", "\x1b") else ""
-                text = prompt_text(stdscr, "goto date", initial)
-                target = parse_jump(text, state.today)
-                if target:
-                    state.week_start = week_start_for(target)
-                    state.cursor_day = target.weekday()
-                    state.clamp_cursor()
-                    status = target.isoformat()
+        elif is_action(key, "goto_prefix"):
+            draw(stdscr, state, " ".join(key_buffer), show_help=False)
+            if key == "G":
+                key_buffer[-1] = "G"
+                draw(stdscr, state, " ".join(key_buffer), show_help=False)
+                text = prompt_text(stdscr, "go to date", "")
+                if not text.strip():
+                    status = ""
                 else:
-                    status = "invalid date"
-        elif key == "/":
+                    target = parse_jump(text, state.today)
+                    if target:
+                        state.week_start = week_start_for(target, state.first_weekday)
+                        state.cursor_day = weekday_index(target, state.first_weekday)
+                        state.cursor_idx = 0
+                        state.clamp_cursor()
+                        status = target.isoformat()
+                    else:
+                        status = "invalid date"
+            else:
+                prompt_state = KeyState()
+                try:
+                    first = read_key(stdscr, prompt_state, allow_repeat_keys=config.keybinds.get("goto_prefix", set()))
+                except curses.error:
+                    first = ""
+                key_buffer.append(format_key(first))
+                draw(stdscr, state, " ".join(key_buffer), show_help=False)
+                if first == "g":
+                    target = state.today
+                    state.week_start = week_start_for(target, state.first_weekday)
+                    state.cursor_day = weekday_index(target, state.first_weekday)
+                    state.clamp_cursor()
+                    status = "today"
+                elif first == "G":
+                    text = prompt_text(stdscr, "go to date", "")
+                    if not text.strip():
+                        status = ""
+                    else:
+                        target = parse_jump(text, state.today)
+                        if target:
+                            state.week_start = week_start_for(target, state.first_weekday)
+                            state.cursor_day = weekday_index(target, state.first_weekday)
+                            state.cursor_idx = 0
+                            state.clamp_cursor()
+                            status = target.isoformat()
+                        else:
+                            status = "invalid date"
+                elif first in ("\x1b",):
+                    status = ""
+                else:
+                    status = ""
+            key_buffer.clear()
+        elif is_action(key, "command"):
+            status = handle_command(stdscr, state, config)
+            key_buffer.clear()
+        elif is_action(key, "search_forward"):
             draw(stdscr, state, show_help=False)
             q = prompt_text(stdscr, "search /")
             if q:
@@ -561,13 +1026,13 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, q, 1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date)
-                    state.cursor_day = date.weekday()
+                    state.week_start = week_start_for(date, state.first_weekday)
+                    state.cursor_day = weekday_index(date, state.first_weekday)
                     state.cursor_idx = idx
                     status = f"{q}"
                 else:
                     status = "no match"
-        elif key == "?":
+        elif is_action(key, "search_backward"):
             draw(stdscr, state, show_help=False)
             q = prompt_text(stdscr, "search ?")
             if q:
@@ -576,38 +1041,43 @@ def main(stdscr: curses.window) -> None:
                 found = find_match(state, q, -1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date)
-                    state.cursor_day = date.weekday()
+                    state.week_start = week_start_for(date, state.first_weekday)
+                    state.cursor_day = weekday_index(date, state.first_weekday)
                     state.cursor_idx = idx
                     status = f"{q}"
                 else:
                     status = "no match"
-        elif key == "n":
+        elif is_action(key, "search_next"):
             if not state.search_query:
                 status = "no search"
             else:
                 found = find_match(state, state.search_query, 1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date)
-                    state.cursor_day = date.weekday()
+                    state.week_start = week_start_for(date, state.first_weekday)
+                    state.cursor_day = weekday_index(date, state.first_weekday)
                     state.cursor_idx = idx
                     status = state.search_query
                 else:
                     status = "no match"
-        elif key == "N":
+        elif is_action(key, "search_prev"):
             if not state.search_query:
                 status = "no search"
             else:
                 found = find_match(state, state.search_query, -1)
                 if found:
                     date, idx = found
-                    state.week_start = week_start_for(date)
-                    state.cursor_day = date.weekday()
+                    state.week_start = week_start_for(date, state.first_weekday)
+                    state.cursor_day = weekday_index(date, state.first_weekday)
                     state.cursor_idx = idx
                     status = state.search_query
                 else:
                     status = "no match"
+
+        if not hold_buffer and status != "pending dd" and status != "pending yy":
+            key_buffer.clear()
+        if not status and key_buffer:
+            status = " ".join(key_buffer)
 
 
 if __name__ == "__main__":
